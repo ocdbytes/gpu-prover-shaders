@@ -33,7 +33,7 @@ fn cpu_fold_recursive(values: &mut Vec<Fr>, weight: Fr) {
 }
 
 pub fn bench_fold(gpu: &GpuContext) {
-    let test_sizes: &[u32] = &[12, 16, 18, 20, 22];
+    let test_sizes: &[u32] = &[11, 12, 14, 16, 18, 20, 22];
     let iters = 5;
 
     println!("\n=== Fold Sweep ===");
@@ -110,8 +110,8 @@ pub fn bench_fold(gpu: &GpuContext) {
 
         let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
         println!(
-            "  d={num_vars:2} | 2^{num_vars} = {:>8} -> {:>8} elements | CPU: {:>10.2?} | GPU: {:>10.2?} | {:.2}x",
-            full_size, half, cpu_median, gpu_median, speedup
+            "  2^{num_vars:2} = {full_size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
+            cpu_median, gpu_median
         );
     }
 }

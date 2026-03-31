@@ -4,6 +4,7 @@ use std::ffi::c_void;
 
 const LIB_FIELD_DATA: &[u8] = include_bytes!("../../shaders/dotprod_field.metallib");
 const LIB_EVAL_EQ_DATA: &[u8] = include_bytes!("../../shaders/eval_eq.metallib");
+const LIB_EVAL_EQ_TREE_DATA: &[u8] = include_bytes!("../../shaders/eval_eq_tree.metallib");
 const LIB_FOLD_DATA: &[u8] = include_bytes!("../../shaders/fold.metallib");
 
 const BUFFER_OPTIONS: MTLResourceOptions = MTLResourceOptions::from_bits_truncate(
@@ -34,11 +35,19 @@ impl GpuContext {
             pipelines.insert(name, pipeline);
         }
 
-        // Load eval_eq kernel
+        // Load eval_eq kernels
         let eval_eq_lib = device
             .new_library_with_data(LIB_EVAL_EQ_DATA)
             .expect("Failed to load eval_eq metal lib");
         pipelines.insert("eval_eq_field", Self::make_pipeline(&device, &eval_eq_lib, "eval_eq_field"));
+
+        let eval_eq_tree_lib = device
+            .new_library_with_data(LIB_EVAL_EQ_TREE_DATA)
+            .expect("Failed to load eval_eq_tree metal lib");
+        pipelines.insert(
+            "eval_eq_tree_expand",
+            Self::make_pipeline(&device, &eval_eq_tree_lib, "eval_eq_tree_expand"),
+        );
 
         // Load fold kernel
         let fold_lib = device
@@ -141,6 +150,58 @@ impl GpuContext {
 
         command_buffer.commit();
         command_buffer.wait_until_completed();
+    }
+
+    /// Multi-pass tree expansion for eval_eq.
+    ///
+    /// Encodes all tree levels into a single command buffer (one compute encoder
+    /// per level) with implicit memory barriers between passes. Ping-pongs
+    /// between `buf_a` and `buf_b`: even-indexed passes read from `buf_a` and
+    /// write to `buf_b`, odd-indexed passes do the reverse.
+    ///
+    /// Returns `true` if the result landed in `buf_b` (odd number of passes).
+    pub fn dispatch_eval_eq_tree(
+        &self,
+        buf_a: &Buffer,
+        buf_b: &Buffer,
+        buf_point: &Buffer,
+        levels: std::ops::Range<usize>,
+    ) -> bool {
+        let pipeline = self.pipeline("eval_eq_tree_expand");
+        let command_buffer = self.command_queue.new_command_buffer();
+        let num_passes = levels.len();
+
+        for (i, level) in levels.enumerate() {
+            let (src, dst) = if i % 2 == 0 {
+                (buf_a, buf_b)
+            } else {
+                (buf_b, buf_a)
+            };
+            let level_u32 = level as u32;
+
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(src), 0);
+            encoder.set_buffer(1, Some(dst), 0);
+            encoder.set_buffer(2, Some(buf_point), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &level_u32 as *const u32 as *const _,
+            );
+
+            let num_threads = 1u64 << level;
+            let grid_size = MTLSize::new(num_threads, 1, 1);
+            let tg_size = threadgroup_size_for(pipeline, num_threads);
+            encoder.dispatch_threads(grid_size, tg_size);
+            encoder.end_encoding();
+        }
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Result is in buf_b if odd number of passes, buf_a otherwise
+        num_passes % 2 == 1
     }
 
     /// Batch dispatch: encode multiple kernel invocations into one command buffer.

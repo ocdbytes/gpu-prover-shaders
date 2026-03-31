@@ -13,7 +13,15 @@ pub fn bench_mul(gpu: &GpuContext) {
     // From provekit counters: dot_product avg 2093, max 627063
     // Element-wise mul is the kernel used inside dot_product.
     // Sweep realistic sizes.
-    let test_sizes: &[usize] = &[2048, 65536, 262144, 1_048_576];
+    let test_sizes: &[usize] = &[
+        1 << 11, // 2048
+        1 << 12,
+        1 << 14,
+        1 << 16,
+        1 << 18,
+        1 << 20,
+        1 << 22,
+    ];
     let iters = 5;
 
     println!("\n=== Element-wise Multiply Sweep ===");
@@ -25,24 +33,19 @@ pub fn bench_mul(gpu: &GpuContext) {
 
         // CPU (parallel — matches whir's rayon usage)
         let mut cpu_times = Vec::with_capacity(iters);
+        let mut cpu_results_buf: Vec<Fr> = vec![Fr::from(0u64); n];
         for _ in 0..iters {
             let start = Instant::now();
-            let _results: Vec<Fr> = a_field
-                .par_iter()
-                .zip(b_field.par_iter())
-                .map(|(a, b)| *a * *b)
-                .collect();
+            cpu_results_buf
+                .par_iter_mut()
+                .zip(a_field.par_iter().zip(b_field.par_iter()))
+                .for_each(|(out, (a, b))| *out = *a * *b);
             cpu_times.push(start.elapsed());
         }
         cpu_times.sort();
         let cpu_median = cpu_times[iters / 2];
 
-        // CPU reference for verification
-        let cpu_results: Vec<Fr> = a_field
-            .iter()
-            .zip(b_field.iter())
-            .map(|(a, b)| *a * *b)
-            .collect();
+        // cpu_results_buf already holds the correct results from the last timed iteration
 
         // GPU
         let a_limbs: Vec<u32> = a_field.iter().flat_map(|f| f.to_mont_limbs()).collect();
@@ -77,20 +80,28 @@ pub fn bench_mul(gpu: &GpuContext) {
         if n <= 65536 {
             let ptr = buf_result.contents() as *const u32;
             let result_u32s = unsafe { std::slice::from_raw_parts(ptr, n * 8) };
-            verify_results(result_u32s, &cpu_results, n, &format!("mul n={n}"));
+            verify_results(result_u32s, &cpu_results_buf, n, &format!("mul n={n}"));
         }
 
+        let d = n.trailing_zeros();
         let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
         println!(
-            "  n={n:>8} | CPU(rayon): {:>10.2?} | GPU: {:>10.2?} | {:.2}x",
-            cpu_median, gpu_median, speedup
+            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
+            cpu_median, gpu_median
         );
     }
 }
 
 pub fn bench_scalar_mul_add(gpu: &GpuContext) {
-    // From provekit counters: scalar_mul_add avg 2095, max 4096
-    let test_sizes: &[usize] = &[2048, 4096, 65536, 262144, 1_048_576];
+    let test_sizes: &[usize] = &[
+        1 << 11, // 2048
+        1 << 12,
+        1 << 14,
+        1 << 16,
+        1 << 18,
+        1 << 20,
+        1 << 22,
+    ];
     let iters = 5;
 
     println!("\n=== Scalar Mul-Add Sweep: acc[i] += weight * vec[i] ===");
@@ -165,10 +176,11 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
             verify_results(result_u32s, &cpu_results, n, &format!("sma n={n}"));
         }
 
+        let d = n.trailing_zeros();
         let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
         println!(
-            "  n={n:>8} | CPU(rayon): {:>10.2?} | GPU: {:>10.2?} | {:.2}x",
-            cpu_median, gpu_median, speedup
+            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
+            cpu_median, gpu_median
         );
     }
 }

@@ -48,20 +48,25 @@ fn cpu_eval_eq_naive(accumulator: &mut [Fr], point: &[Fr], scalar: Fr) {
     }
 }
 
+/// Cutoff: the first CUTOFF levels are computed on CPU, remaining on GPU.
+/// 2^10 = 1024 elements — instant on CPU, avoids tiny GPU dispatches.
+const TREE_CUTOFF: usize = 10;
+
 pub fn bench_eval_eq(gpu: &GpuContext) {
-    let test_num_vars: &[u32] = &[12, 16, 18, 20, 22];
+    let test_num_vars: &[u32] = &[11, 12, 14, 16, 18, 20, 22];
     let iters = 5;
 
-    println!("\n=== Eval Eq Sweep ===");
+    println!("\n=== Eval Eq Sweep (Tree) ===");
 
     for &num_vars in test_num_vars {
-        let size = 1usize << num_vars;
+        let n = num_vars as usize;
+        let size = 1usize << n;
         let mut rng = ark_std::test_rng();
 
         let point: Vec<Fr> = (0..num_vars).map(|_| Fr::rand(&mut rng)).collect();
         let scalar = Fr::rand(&mut rng);
 
-        // CPU (whir's recursive + rayon)
+        // ── CPU benchmark (recursive + rayon) ────────────────────────
         let mut cpu_times = Vec::with_capacity(iters);
         let mut cpu_acc = vec![Fr::from(0u64); size];
         for _ in 0..iters {
@@ -73,54 +78,72 @@ pub fn bench_eval_eq(gpu: &GpuContext) {
         cpu_times.sort();
         let cpu_median = cpu_times[iters / 2];
 
-        // GPU
-        let point_limbs: Vec<u32> = point.iter().flat_map(|f| f.to_mont_limbs()).collect();
-        let scalar_limbs: Vec<u32> = scalar.to_mont_limbs().to_vec();
+        // ── GPU tree benchmark ───────────────────────────────────────
+        let cutoff = TREE_CUTOFF.min(n);
 
-        let buf_acc = gpu.create_buffer_zeroed(size * 8);
+        // CPU seed: compute the first `cutoff` levels on CPU
+        let cpu_seed_size = 1usize << cutoff;
+        let mut seed = vec![Fr::from(0u64); cpu_seed_size];
+        cpu_eval_eq_recursive(&mut seed, &point[..cutoff], scalar);
+        let seed_limbs: Vec<u32> = seed.iter().flat_map(|f| f.to_mont_limbs()).collect();
+
+        // GPU buffers (double-buffered ping-pong)
+        let point_limbs: Vec<u32> = point.iter().flat_map(|f| f.to_mont_limbs()).collect();
+        let buf_a = gpu.create_buffer_zeroed(size * 8);
+        let buf_b = gpu.create_buffer_zeroed(size * 8);
         let buf_point = gpu.create_buffer(&point_limbs);
-        let buf_scalar = gpu.create_buffer(&scalar_limbs);
-        let num_vars_bytes = num_vars.to_ne_bytes();
+
+        // Upload seed into buf_a
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                seed_limbs.as_ptr(),
+                buf_a.contents() as *mut u32,
+                seed_limbs.len(),
+            );
+        }
 
         // Warmup
-        gpu.dispatch_with_bytes(
-            "eval_eq_field",
-            &[&buf_acc, &buf_point, &buf_scalar],
-            &[&num_vars_bytes],
-            1u64 << num_vars,
-        );
+        gpu.dispatch_eval_eq_tree(&buf_a, &buf_b, &buf_point, cutoff..n);
 
+        // Timed runs
         let mut gpu_times = Vec::with_capacity(iters);
+        let mut result_in_b = false;
         for _ in 0..iters {
+            // Reset buf_a with seed data
             unsafe {
-                std::ptr::write_bytes(buf_acc.contents() as *mut u8, 0, size * 8 * 4);
+                std::ptr::copy_nonoverlapping(
+                    seed_limbs.as_ptr(),
+                    buf_a.contents() as *mut u32,
+                    seed_limbs.len(),
+                );
             }
             let start = Instant::now();
-            gpu.dispatch_with_bytes(
-                "eval_eq_field",
-                &[&buf_acc, &buf_point, &buf_scalar],
-                &[&num_vars_bytes],
-                1u64 << num_vars,
-            );
+            result_in_b = gpu.dispatch_eval_eq_tree(&buf_a, &buf_b, &buf_point, cutoff..n);
             gpu_times.push(start.elapsed());
         }
         gpu_times.sort();
         let gpu_median = gpu_times[iters / 2];
 
-        // Verify at smallest sizes only (naive is too slow for large)
+        // Verify at smallest sizes (naive is O(n * 2^n), too slow for large n)
         if num_vars <= 16 {
+            let result_buf = if result_in_b { &buf_b } else { &buf_a };
             let mut verify_acc = vec![Fr::from(0u64); size];
             cpu_eval_eq_naive(&mut verify_acc, &point, scalar);
 
-            let ptr = buf_acc.contents() as *const u32;
+            let ptr = result_buf.contents() as *const u32;
             let result_u32s = unsafe { std::slice::from_raw_parts(ptr, size * 8) };
-            verify_results(result_u32s, &verify_acc, size, &format!("eval_eq d={num_vars}"));
+            verify_results(
+                result_u32s,
+                &verify_acc,
+                size,
+                &format!("eval_eq_tree d={num_vars}"),
+            );
         }
 
         let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
         println!(
-            "  d={num_vars:2} | 2^{num_vars} = {:>8} elements | CPU: {:>10.2?} | GPU: {:>10.2?} | {:.2}x",
-            size, cpu_median, gpu_median, speedup
+            "  2^{num_vars:2} = {size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
+            cpu_median, gpu_median
         );
     }
 }

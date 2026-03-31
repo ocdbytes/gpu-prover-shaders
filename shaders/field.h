@@ -41,6 +41,7 @@ constant FieldElement MONT_ONE = {{
 
 // Returns true if a >= P
 inline bool check_gte(FieldElement a) {
+    #pragma unroll
     for (int i = 7; i >= 0; i--) {
         if (a.limbs[i] > P.limbs[i]) return true;
         if (a.limbs[i] < P.limbs[i]) return false;
@@ -48,27 +49,35 @@ inline bool check_gte(FieldElement a) {
     return true; // equal
 }
 
-// Computes a - P, assuming a >= P
+// Computes a - P, assuming a >= P (pure 32-bit)
 inline FieldElement subtract_P(FieldElement a) {
     FieldElement result;
     uint borrow = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         uint ai = a.limbs[i];
         uint pi = P.limbs[i];
-        result.limbs[i] = ai - pi - borrow;
-        borrow = (ai < pi) || (ai == pi && borrow) ? 1u : 0u;
+        uint diff = ai - pi;
+        uint b1 = (ai < pi) ? 1u : 0u;
+        result.limbs[i] = diff - borrow;
+        uint b2 = (diff < borrow) ? 1u : 0u;
+        borrow = b1 + b2;
     }
     return result;
 }
 
-// Modular addition: (a + b) mod P
+// Modular addition: (a + b) mod P — pure 32-bit carry chain
 inline FieldElement field_add(FieldElement a, FieldElement b) {
     FieldElement result;
     uint carry = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
-        ulong sum = (ulong)a.limbs[i] + (ulong)b.limbs[i] + carry;
-        result.limbs[i] = (uint)(sum & 0xFFFFFFFF);
-        carry = (uint)(sum >> 32);
+        uint s = a.limbs[i] + b.limbs[i];
+        uint c = (s < a.limbs[i]) ? 1u : 0u;
+        uint r = s + carry;
+        c += (r < s) ? 1u : 0u;
+        result.limbs[i] = r;
+        carry = c;
     }
     if (check_gte(result)) {
         result = subtract_P(result);
@@ -76,23 +85,31 @@ inline FieldElement field_add(FieldElement a, FieldElement b) {
     return result;
 }
 
-// Modular subtraction: (a - b) mod P
+// Modular subtraction: (a - b) mod P — pure 32-bit borrow chain
 inline FieldElement field_sub(FieldElement a, FieldElement b) {
     FieldElement result;
     uint borrow = 0;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         uint ai = a.limbs[i];
         uint bi = b.limbs[i];
-        result.limbs[i] = ai - bi - borrow;
-        borrow = (ai < bi) || (ai == bi && borrow) ? 1u : 0u;
+        uint diff = ai - bi;
+        uint b1 = (ai < bi) ? 1u : 0u;
+        result.limbs[i] = diff - borrow;
+        uint b2 = (diff < borrow) ? 1u : 0u;
+        borrow = b1 + b2;
     }
-    // If underflow, add P back
+    // If underflow, add P back (pure 32-bit)
     if (borrow) {
         uint carry = 0;
+        #pragma unroll
         for (int i = 0; i < 8; i++) {
-            ulong sum = (ulong)result.limbs[i] + (ulong)P.limbs[i] + carry;
-            result.limbs[i] = (uint)(sum & 0xFFFFFFFF);
-            carry = (uint)(sum >> 32);
+            uint s = result.limbs[i] + P.limbs[i];
+            uint c = (s < result.limbs[i]) ? 1u : 0u;
+            uint r = s + carry;
+            c += (r < s) ? 1u : 0u;
+            result.limbs[i] = r;
+            carry = c;
         }
     }
     return result;
@@ -103,9 +120,11 @@ inline FieldElement field_sub(FieldElement a, FieldElement b) {
 inline FieldElement field_mul(FieldElement a, FieldElement b) {
     ulong T[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         // Part A: T += a[i] * b
         ulong carry = 0;
+        #pragma unroll
         for (int j = 0; j < 8; j++) {
             ulong product = (ulong)a.limbs[i] * (ulong)b.limbs[j];
             ulong sum = T[j] + product + carry;
@@ -118,6 +137,7 @@ inline FieldElement field_mul(FieldElement a, FieldElement b) {
         uint m = (uint)T[0] * P_INV;
 
         carry = 0;
+        #pragma unroll
         for (int j = 0; j < 8; j++) {
             ulong product = (ulong)m * (ulong)P.limbs[j];
             ulong sum = T[j] + product + carry;
@@ -127,6 +147,7 @@ inline FieldElement field_mul(FieldElement a, FieldElement b) {
         T[8] += carry;
 
         // Shift right
+        #pragma unroll
         for (int j = 0; j < 8; j++) {
             T[j] = T[j + 1];
         }
@@ -134,6 +155,7 @@ inline FieldElement field_mul(FieldElement a, FieldElement b) {
     }
 
     FieldElement result;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         result.limbs[i] = (uint)T[i];
     }
@@ -149,6 +171,7 @@ inline FieldElement field_mul(FieldElement a, FieldElement b) {
 inline FieldElement field_select(FieldElement a, FieldElement b, uint condition) {
     FieldElement result;
     uint mask = 0u - condition; // 0x00000000 or 0xFFFFFFFF
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         result.limbs[i] = (a.limbs[i] & mask) | (b.limbs[i] & ~mask);
     }
@@ -159,6 +182,7 @@ inline FieldElement field_select(FieldElement a, FieldElement b, uint condition)
 inline FieldElement field_load(const constant uint *buf, uint element_index) {
     FieldElement e;
     uint offset = element_index * 8;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         e.limbs[i] = buf[offset + i];
     }
@@ -169,6 +193,7 @@ inline FieldElement field_load(const constant uint *buf, uint element_index) {
 inline FieldElement field_load_device(const device uint *buf, uint element_index) {
     FieldElement e;
     uint offset = element_index * 8;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         e.limbs[i] = buf[offset + i];
     }
@@ -178,6 +203,7 @@ inline FieldElement field_load_device(const device uint *buf, uint element_index
 // Store a field element into a device buffer at a given element index
 inline void field_store(device uint *buf, uint element_index, FieldElement e) {
     uint offset = element_index * 8;
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         buf[offset + i] = e.limbs[i];
     }
