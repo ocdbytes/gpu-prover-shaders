@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 metal = "0.33.0"
+objc = "0.2"
 rand = "0.10.0"
 ark-ff = { version = "0.5", features = ["asm", "std"] }
 ark-std = { version = "0.5", features = ["std"] }

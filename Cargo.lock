@@ -520,6 +520,7 @@ dependencies = [
  "ark-std",
  "libc",
  "metal",
+ "objc",
  "rand 0.10.0",
  "rayon",
 ]

@@ -5,20 +5,18 @@ use ark_std::UniformRand;
 use rayon::prelude::*;
 
 use crate::field::Conversion;
-use crate::gpu::{GpuContext, to_page_aligned};
+use crate::gpu::{GpuContext, GpuTiming, to_page_aligned};
 
 use super::verify_results;
 
 pub fn bench_mul(gpu: &GpuContext) {
-    // From provekit counters: dot_product avg 2093, max 627063
-    // Element-wise mul is the kernel used inside dot_product.
-    // Sweep realistic sizes.
     let test_sizes: &[usize] = &[
         1 << 11, // 2048
         1 << 12,
         1 << 14,
         1 << 16,
         1 << 18,
+        1 << 19,
         1 << 20,
         1 << 22,
     ];
@@ -31,7 +29,7 @@ pub fn bench_mul(gpu: &GpuContext) {
         let a_field: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
         let b_field: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
 
-        // CPU (parallel — matches whir's rayon usage)
+        // CPU (parallel)
         let mut cpu_times = Vec::with_capacity(iters);
         let mut cpu_results_buf: Vec<Fr> = vec![Fr::from(0u64); n];
         for _ in 0..iters {
@@ -45,8 +43,6 @@ pub fn bench_mul(gpu: &GpuContext) {
         cpu_times.sort();
         let cpu_median = cpu_times[iters / 2];
 
-        // cpu_results_buf already holds the correct results from the last timed iteration
-
         // GPU
         let a_limbs: Vec<u32> = a_field.iter().flat_map(|f| f.to_mont_limbs()).collect();
         let b_limbs: Vec<u32> = b_field.iter().flat_map(|f| f.to_mont_limbs()).collect();
@@ -58,24 +54,15 @@ pub fn bench_mul(gpu: &GpuContext) {
         let buf_result = gpu.create_buffer_zeroed(n * 8);
 
         // Warmup
-        gpu.dispatch(
-            "dot_product_field",
-            &[&buf_a, &buf_b, &buf_result],
-            n as u64,
-        );
+        gpu.dispatch("dot_product_field", &[&buf_a, &buf_b, &buf_result], n as u64);
 
-        let mut gpu_times = Vec::with_capacity(iters);
+        let mut gpu_timings: Vec<GpuTiming> = Vec::with_capacity(iters);
         for _ in 0..iters {
-            let start = Instant::now();
-            gpu.dispatch(
-                "dot_product_field",
-                &[&buf_a, &buf_b, &buf_result],
-                n as u64,
-            );
-            gpu_times.push(start.elapsed());
+            let t = gpu.dispatch_timed("dot_product_field", &[&buf_a, &buf_b, &buf_result], n as u64);
+            gpu_timings.push(t);
         }
-        gpu_times.sort();
-        let gpu_median = gpu_times[iters / 2];
+        gpu_timings.sort_by_key(|t| t.total);
+        let med = gpu_timings[iters / 2];
 
         if n <= 65536 {
             let ptr = buf_result.contents() as *const u32;
@@ -84,10 +71,10 @@ pub fn bench_mul(gpu: &GpuContext) {
         }
 
         let d = n.trailing_zeros();
-        let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
+        let speedup = cpu_median.as_secs_f64() / med.total.as_secs_f64();
         println!(
-            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
-            cpu_median, gpu_median
+            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} (compute: {:>10.2?}) | {speedup:.2}x",
+            cpu_median, med.total, med.compute
         );
     }
 }
@@ -99,6 +86,7 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
         1 << 14,
         1 << 16,
         1 << 18,
+        1 << 19,
         1 << 20,
         1 << 22,
     ];
@@ -112,7 +100,7 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
         let vector: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
         let accumulator: Vec<Fr> = (0..n).map(|_| Fr::rand(&mut rng)).collect();
 
-        // CPU (parallel — matches whir's rayon usage)
+        // CPU (parallel)
         let mut cpu_times = Vec::with_capacity(iters);
         for _ in 0..iters {
             let mut acc = accumulator.clone();
@@ -143,13 +131,9 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
         let buf_vector = unsafe { gpu.wrap_buffer_no_copy(&vector_aligned) };
 
         // Warmup
-        gpu.dispatch(
-            "scalar_mul_add_field",
-            &[&buf_acc, &buf_weight, &buf_vector],
-            n as u64,
-        );
+        gpu.dispatch("scalar_mul_add_field", &[&buf_acc, &buf_weight, &buf_vector], n as u64);
 
-        let mut gpu_times = Vec::with_capacity(iters);
+        let mut gpu_timings: Vec<GpuTiming> = Vec::with_capacity(iters);
         for _ in 0..iters {
             // Reset accumulator
             unsafe {
@@ -159,16 +143,11 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
                     acc_limbs.len(),
                 );
             }
-            let start = Instant::now();
-            gpu.dispatch(
-                "scalar_mul_add_field",
-                &[&buf_acc, &buf_weight, &buf_vector],
-                n as u64,
-            );
-            gpu_times.push(start.elapsed());
+            let t = gpu.dispatch_timed("scalar_mul_add_field", &[&buf_acc, &buf_weight, &buf_vector], n as u64);
+            gpu_timings.push(t);
         }
-        gpu_times.sort();
-        let gpu_median = gpu_times[iters / 2];
+        gpu_timings.sort_by_key(|t| t.total);
+        let med = gpu_timings[iters / 2];
 
         if n <= 65536 {
             let ptr = buf_acc.contents() as *const u32;
@@ -177,10 +156,10 @@ pub fn bench_scalar_mul_add(gpu: &GpuContext) {
         }
 
         let d = n.trailing_zeros();
-        let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
+        let speedup = cpu_median.as_secs_f64() / med.total.as_secs_f64();
         println!(
-            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
-            cpu_median, gpu_median
+            "  2^{d:2} = {n:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} (compute: {:>10.2?}) | {speedup:.2}x",
+            cpu_median, med.total, med.compute
         );
     }
 }

@@ -4,7 +4,7 @@ use ark_bn254::Fr;
 use ark_std::UniformRand;
 
 use crate::field::Conversion;
-use crate::gpu::GpuContext;
+use crate::gpu::{GpuContext, GpuTiming};
 
 use super::verify_results;
 
@@ -53,7 +53,7 @@ fn cpu_eval_eq_naive(accumulator: &mut [Fr], point: &[Fr], scalar: Fr) {
 const TREE_CUTOFF: usize = 10;
 
 pub fn bench_eval_eq(gpu: &GpuContext) {
-    let test_num_vars: &[u32] = &[11, 12, 14, 16, 18, 20, 22];
+    let test_num_vars: &[u32] = &[11, 12, 14, 16, 18, 19, 20, 22];
     let iters = 5;
 
     println!("\n=== Eval Eq Sweep (Tree) ===");
@@ -106,7 +106,7 @@ pub fn bench_eval_eq(gpu: &GpuContext) {
         gpu.dispatch_eval_eq_tree(&buf_a, &buf_b, &buf_point, cutoff..n);
 
         // Timed runs
-        let mut gpu_times = Vec::with_capacity(iters);
+        let mut gpu_timings: Vec<GpuTiming> = Vec::with_capacity(iters);
         let mut result_in_b = false;
         for _ in 0..iters {
             // Reset buf_a with seed data
@@ -117,12 +117,12 @@ pub fn bench_eval_eq(gpu: &GpuContext) {
                     seed_limbs.len(),
                 );
             }
-            let start = Instant::now();
-            result_in_b = gpu.dispatch_eval_eq_tree(&buf_a, &buf_b, &buf_point, cutoff..n);
-            gpu_times.push(start.elapsed());
+            let (rib, t) = gpu.dispatch_eval_eq_tree_timed(&buf_a, &buf_b, &buf_point, cutoff..n);
+            result_in_b = rib;
+            gpu_timings.push(t);
         }
-        gpu_times.sort();
-        let gpu_median = gpu_times[iters / 2];
+        gpu_timings.sort_by_key(|t| t.total);
+        let med = gpu_timings[iters / 2];
 
         // Verify at smallest sizes (naive is O(n * 2^n), too slow for large n)
         if num_vars <= 16 {
@@ -140,10 +140,10 @@ pub fn bench_eval_eq(gpu: &GpuContext) {
             );
         }
 
-        let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
+        let speedup = cpu_median.as_secs_f64() / med.total.as_secs_f64();
         println!(
-            "  2^{num_vars:2} = {size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
-            cpu_median, gpu_median
+            "  2^{num_vars:2} = {size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} (compute: {:>10.2?}) | {speedup:.2}x",
+            cpu_median, med.total, med.compute
         );
     }
 }

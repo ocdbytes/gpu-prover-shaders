@@ -4,7 +4,7 @@ use ark_bn254::Fr;
 use ark_std::UniformRand;
 
 use crate::field::Conversion;
-use crate::gpu::GpuContext;
+use crate::gpu::{GpuContext, GpuTiming};
 
 use super::verify_results;
 
@@ -15,10 +15,7 @@ fn cpu_fold_recursive(values: &mut Vec<Fr>, weight: Fr) {
             let split = low.len() / 2;
             let (ll, lr) = low.split_at_mut(split);
             let (hl, hr) = high.split_at(split);
-            rayon::join(
-                || recurse(ll, hl, weight),
-                || recurse(lr, hr, weight),
-            );
+            rayon::join(|| recurse(ll, hl, weight), || recurse(lr, hr, weight));
             return;
         }
         for (lo, hi) in low.iter_mut().zip(high) {
@@ -33,7 +30,7 @@ fn cpu_fold_recursive(values: &mut Vec<Fr>, weight: Fr) {
 }
 
 pub fn bench_fold(gpu: &GpuContext) {
-    let test_sizes: &[u32] = &[11, 12, 14, 16, 18, 20, 22];
+    let test_sizes: &[u32] = &[11, 12, 14, 16, 18, 19, 20, 22];
     let iters = 5;
 
     println!("\n=== Fold Sweep ===");
@@ -47,8 +44,6 @@ pub fn bench_fold(gpu: &GpuContext) {
         let original: Vec<Fr> = (0..full_size).map(|_| Fr::rand(&mut rng)).collect();
 
         // CPU (whir's recursive + rayon)
-        // Pre-allocate the working buffer once, reset it each iteration.
-        // This matches whir's behavior: fold operates in-place, no clone.
         let mut cpu_work = original.clone();
         let mut cpu_times = Vec::with_capacity(iters);
         for _ in 0..iters {
@@ -82,7 +77,7 @@ pub fn bench_fold(gpu: &GpuContext) {
             half as u64,
         );
 
-        let mut gpu_times = Vec::with_capacity(iters);
+        let mut gpu_timings: Vec<GpuTiming> = Vec::with_capacity(iters);
         for _ in 0..iters {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -91,27 +86,26 @@ pub fn bench_fold(gpu: &GpuContext) {
                     original_limbs.len(),
                 );
             }
-            let start = Instant::now();
-            gpu.dispatch_with_bytes(
+            let t = gpu.dispatch_with_bytes_timed(
                 "fold_field",
                 &[&buf_values, &buf_weight],
                 &[&half_size_bytes],
                 half as u64,
             );
-            gpu_times.push(start.elapsed());
+            gpu_timings.push(t);
         }
-        gpu_times.sort();
-        let gpu_median = gpu_times[iters / 2];
+        gpu_timings.sort_by_key(|t| t.total);
+        let med = gpu_timings[iters / 2];
 
         // Verify — only the first half_size elements matter
         let ptr = buf_values.contents() as *const u32;
         let result_u32s = unsafe { std::slice::from_raw_parts(ptr, half * 8) };
         verify_results(result_u32s, &cpu_ref, half, &format!("fold d={num_vars}"));
 
-        let speedup = cpu_median.as_secs_f64() / gpu_median.as_secs_f64();
+        let speedup = cpu_median.as_secs_f64() / med.total.as_secs_f64();
         println!(
-            "  2^{num_vars:2} = {full_size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} | {speedup:.2}x",
-            cpu_median, gpu_median
+            "  2^{num_vars:2} = {full_size:>8} | CPU: {:>10.2?} | GPU: {:>10.2?} (compute: {:>10.2?}) | {speedup:.2}x",
+            cpu_median, med.total, med.compute
         );
     }
 }

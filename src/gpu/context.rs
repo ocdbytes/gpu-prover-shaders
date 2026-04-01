@@ -1,6 +1,25 @@
 use metal::*;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
+
+/// Timing breakdown for a GPU dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuTiming {
+    /// Wall-clock time from encode start through wait_until_completed.
+    pub total: Duration,
+    /// GPU-reported kernel execution time (from Metal's GPUStartTime/GPUEndTime).
+    pub compute: Duration,
+}
+
+/// Read GPU timestamps from a completed command buffer via ObjC runtime.
+fn gpu_elapsed(command_buffer: &CommandBufferRef) -> Duration {
+    unsafe {
+        let start: f64 = msg_send![command_buffer, GPUStartTime];
+        let end: f64 = msg_send![command_buffer, GPUEndTime];
+        Duration::from_secs_f64((end - start).max(0.0))
+    }
+}
 
 const LIB_FIELD_DATA: &[u8] = include_bytes!("../../shaders/dotprod_field.metallib");
 const LIB_EVAL_EQ_DATA: &[u8] = include_bytes!("../../shaders/eval_eq.metallib");
@@ -39,7 +58,10 @@ impl GpuContext {
         let eval_eq_lib = device
             .new_library_with_data(LIB_EVAL_EQ_DATA)
             .expect("Failed to load eval_eq metal lib");
-        pipelines.insert("eval_eq_field", Self::make_pipeline(&device, &eval_eq_lib, "eval_eq_field"));
+        pipelines.insert(
+            "eval_eq_field",
+            Self::make_pipeline(&device, &eval_eq_lib, "eval_eq_field"),
+        );
 
         let eval_eq_tree_lib = device
             .new_library_with_data(LIB_EVAL_EQ_TREE_DATA)
@@ -53,7 +75,10 @@ impl GpuContext {
         let fold_lib = device
             .new_library_with_data(LIB_FOLD_DATA)
             .expect("Failed to load fold metal lib");
-        pipelines.insert("fold_field", Self::make_pipeline(&device, &fold_lib, "fold_field"));
+        pipelines.insert(
+            "fold_field",
+            Self::make_pipeline(&device, &fold_lib, "fold_field"),
+        );
 
         Self {
             device,
@@ -152,6 +177,62 @@ impl GpuContext {
         command_buffer.wait_until_completed();
     }
 
+    /// Timed single dispatch: returns GPU timing breakdown.
+    pub fn dispatch_timed(
+        &self,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        num_threads: u64,
+    ) -> GpuTiming {
+        let pipeline = self.pipeline(pipeline_name);
+        let start = Instant::now();
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encode_dispatch(encoder, pipeline, buffers, num_threads);
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let total = start.elapsed();
+        let compute = gpu_elapsed(command_buffer);
+        GpuTiming { total, compute }
+    }
+
+    /// Timed dispatch with inline bytes arguments: returns GPU timing breakdown.
+    pub fn dispatch_with_bytes_timed(
+        &self,
+        pipeline_name: &str,
+        buffers: &[&Buffer],
+        bytes_args: &[&[u8]],
+        num_threads: u64,
+    ) -> GpuTiming {
+        let pipeline = self.pipeline(pipeline_name);
+        let start = Instant::now();
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+
+        for (i, buf) in buffers.iter().enumerate() {
+            encoder.set_buffer(i as u64, Some(buf), 0);
+        }
+        for (i, bytes) in bytes_args.iter().enumerate() {
+            encoder.set_bytes(
+                (buffers.len() + i) as u64,
+                bytes.len() as u64,
+                bytes.as_ptr() as *const _,
+            );
+        }
+
+        let grid_size = MTLSize::new(num_threads, 1, 1);
+        let tg_size = threadgroup_size_for(pipeline, num_threads);
+        encoder.dispatch_threads(grid_size, tg_size);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let total = start.elapsed();
+        let compute = gpu_elapsed(command_buffer);
+        GpuTiming { total, compute }
+    }
+
     /// Multi-pass tree expansion for eval_eq.
     ///
     /// Encodes all tree levels into a single command buffer (one compute encoder
@@ -202,6 +283,53 @@ impl GpuContext {
 
         // Result is in buf_b if odd number of passes, buf_a otherwise
         num_passes % 2 == 1
+    }
+
+    /// Timed multi-pass tree expansion for eval_eq: returns GPU timing breakdown.
+    pub fn dispatch_eval_eq_tree_timed(
+        &self,
+        buf_a: &Buffer,
+        buf_b: &Buffer,
+        buf_point: &Buffer,
+        levels: std::ops::Range<usize>,
+    ) -> (bool, GpuTiming) {
+        let pipeline = self.pipeline("eval_eq_tree_expand");
+        let start = Instant::now();
+        let command_buffer = self.command_queue.new_command_buffer();
+        let num_passes = levels.len();
+
+        for (i, level) in levels.enumerate() {
+            let (src, dst) = if i % 2 == 0 {
+                (buf_a, buf_b)
+            } else {
+                (buf_b, buf_a)
+            };
+            let level_u32 = level as u32;
+
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(src), 0);
+            encoder.set_buffer(1, Some(dst), 0);
+            encoder.set_buffer(2, Some(buf_point), 0);
+            encoder.set_bytes(
+                3,
+                std::mem::size_of::<u32>() as u64,
+                &level_u32 as *const u32 as *const _,
+            );
+
+            let num_threads = 1u64 << level;
+            let grid_size = MTLSize::new(num_threads, 1, 1);
+            let tg_size = threadgroup_size_for(pipeline, num_threads);
+            encoder.dispatch_threads(grid_size, tg_size);
+            encoder.end_encoding();
+        }
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let total = start.elapsed();
+        let compute = gpu_elapsed(command_buffer);
+        let result_in_b = num_passes % 2 == 1;
+        (result_in_b, GpuTiming { total, compute })
     }
 
     /// Batch dispatch: encode multiple kernel invocations into one command buffer.
